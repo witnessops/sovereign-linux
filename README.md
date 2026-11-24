@@ -4,6 +4,8 @@ Build a disposable x86-64 QEMU machine from Fedora CoreOS stable `44.20261023.3.
 
 The base runs offline. For an attended n8n test, build the runner profile below. Owner pairing and chat delivery remain separate work. Shirudo is optional across both profiles.
 
+An [AWS base candidate](aws/README.md) packages the same configuration with a pinned Fedora CoreOS AMI and explicit launch settings. Its offline builder creates reviewable files only; cloud provisioning and owner pairing have separate acceptance.
+
 ## Build locally
 
 Open a terminal at the root of this checkout. Building requires Bash, GNU coreutils, QEMU's `qemu-img`, Butane, and room for a roughly 2 GB disk copy. KVM is only relevant when booting. All generated files go under the ignored `build/` directory.
