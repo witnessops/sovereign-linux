@@ -1,0 +1,5 @@
+0aaba653cb4e8809d05ef55cb78e419db19839ed60a1504f8a56dcb63bbd3de3  patch-bundles/01-host-rootless.patch
+0071c771540ebad6d1cf3c0a3135ac43ba427a2cf5fe001e36c6bc539abd9c04  patch-bundles/02-private-main-api.patch
+0f692911d44c37afe61c04e2406760998a18175047199664172b3447e4c4e9c5  patch-bundles/03-sigterm-cleanup.patch
+a78aa3e9151e344c78df3e3e1e80b0a4f8dcde0658476943d73a25198eb08aef  patch-bundles/04-poll-response-and-pins.patch
+14c592b34a960760a7ed74d3938a008791ccbc929cf8b84ca751f3bc7a8ed9ae  patch-bundles/exact-four-commits.bundle

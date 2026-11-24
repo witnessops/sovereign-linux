@@ -1,0 +1,238 @@
+diff --git a/scripts/smoke-runner.py b/scripts/smoke-runner.py
+index 7dc93f3..0fb962c 100644
+--- a/scripts/smoke-runner.py
++++ b/scripts/smoke-runner.py
+@@ -1,13 +1,14 @@
+ """Run the bundled synthetic fixture once using a new rootless n8n main and guest."""
+ import argparse
+ import base64
+-from contextlib import ExitStack
++from contextlib import ExitStack, contextmanager
+ from datetime import datetime, timezone
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
+ import secrets
++import signal
+ import socket
+ import sqlite3
+ import subprocess as sp
+@@ -112,6 +113,31 @@ def stop(proc):
+     return proc.wait()
+ 
+ 
++def terminate_on_sigterm(signum, frame):
++    # Allow the active ExitStack and stop.json writer to finish after one stop request.
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++    raise SystemExit(128 + signum)
++
++
++@contextmanager
++def defer_sigterm():
++    # Keep a new resource and its cleanup callback in the same signal-safe step.
++    pending = []
++    previous = signal.getsignal(signal.SIGTERM)
++
++    def remember(signum, frame):
++        pending.append(signum)
++
++    signal.signal(signal.SIGTERM, remember)
++    try:
++        yield
++    finally:
++        signal.signal(signal.SIGTERM, previous)
++        if pending and previous != signal.SIG_IGN:
++            handler = previous if callable(previous) else terminate_on_sigterm
++            handler(pending[0], None)
++
++
+ def configure_guest(bundle, tmp, port):
+     for key in ("client", "host"):
+         run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", tmp / key)
+@@ -177,8 +203,9 @@ def smoke(bundle, evidence):
+         with ExitStack() as stack:
+             tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="sovereign-smoke-")))
+             # Keep the database after shutdown for independent, read-only verification.
+-            run("podman", "network", "create", "--internal", name)
+-            stack.callback(run, "podman", "network", "rm", name)
++            with defer_sigterm():
++                run("podman", "network", "create", "--internal", name)
++                stack.callback(run, "podman", "network", "rm", name)
+             env = dict(os.environ, N8N_RUNNERS_AUTH_TOKEN=token, N8N_ENCRYPTION_KEY=secrets.token_hex(32))
+             settings = ["N8N_RUNNERS_MODE=external", "N8N_RUNNERS_ENABLED=true",
+                         "N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0", "N8N_RUNNERS_MAX_CONCURRENCY=1",
+@@ -189,17 +216,19 @@ def smoke(bundle, evidence):
+                         "N8N_TEMPLATES_ENABLED=false", "N8N_COMMUNITY_PACKAGES_ENABLED=false",
+                         "N8N_PERSONALIZATION_ENABLED=false", "N8N_RUNNERS_AUTH_TOKEN", "N8N_ENCRYPTION_KEY"]
+             env_args = [arg for setting in settings for arg in ("-e", setting)]
+-            cid = run("podman", "create", "--pull=never", "--name", name, "--network", name,
+-                      "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
+-                      "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
+-            stack.callback(run, "podman", "rm", "-v", cid)
+-            run("podman", "start", cid)
+-
+-            def stop_main():
+-                run("podman", "stop", "-t", "20", cid)
+-                cleanup["main_stopped"] = run("podman", "inspect", "--format", "{{.State.Running}}", cid) == "false"
+-
+-            stack.callback(stop_main)
++            with defer_sigterm():
++                cid = run("podman", "create", "--pull=never", "--name", name, "--network", name,
++                          "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
++                          "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
++                stack.callback(run, "podman", "rm", "-v", cid)
++
++                def stop_main():
++                    if run("podman", "inspect", "--format", "{{.State.Running}}", cid) == "true":
++                        run("podman", "stop", "-t", "20", cid)
++                    cleanup["main_stopped"] = run("podman", "inspect", "--format", "{{.State.Running}}", cid) == "false"
++
++                stack.callback(stop_main)
++                run("podman", "start", cid)
+             broker = int(run("podman", "port", cid, "5679").split(":")[-1])
+             request = MainApi(cid).request
+ 
+@@ -227,23 +256,24 @@ def smoke(bundle, evidence):
+             kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+             accel, cpu = ("kvm", "host") if kvm else ("tcg", "max")
+             diag = stack.enter_context((evidence / "qemu.log").open("xb"))
+-            qemu = sp.Popen(["qemu-system-x86_64", "-name", name, "-machine", "q35,dump-guest-core=off",
+-                             "-accel", accel, "-cpu", cpu, "-smp", "2", "-m", "3072",
+-                             "-drive", "if=virtio,format=qcow2,file=machine.qcow2,snapshot=on",
+-                             "-drive", "if=virtio,format=raw,readonly=on,file=runner.iso",
+-                             "-fw_cfg", f"name=opt/com.coreos/config,file={tmp}/run.ign",
+-                             "-netdev", f"user,id=lab,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+-                             "-device", "virtio-net-pci,netdev=lab", "-device", "virtio-rng-pci",
+-                             "-sandbox", "on,obsolete=deny,elevateprivileges=deny,resourcecontrol=deny",
+-                             "-display", "none", "-monitor", "none", "-no-reboot",
+-                             "-serial", f"file:{evidence}/serial.log"], cwd=bundle, stdin=sp.DEVNULL,
+-                            stdout=diag, stderr=diag, env=dict(os.environ, TMPDIR=str(tmp)))
+-
+-            def stop_guest():
+-                cleanup["qemu_exit"] = stop(qemu)
+-                cleanup["vm_stopped"] = qemu.poll() is not None
+-
+-            stack.callback(stop_guest)
++            with defer_sigterm():
++                qemu = sp.Popen(["qemu-system-x86_64", "-name", name, "-machine", "q35,dump-guest-core=off",
++                                 "-accel", accel, "-cpu", cpu, "-smp", "2", "-m", "3072",
++                                 "-drive", "if=virtio,format=qcow2,file=machine.qcow2,snapshot=on",
++                                 "-drive", "if=virtio,format=raw,readonly=on,file=runner.iso",
++                                 "-fw_cfg", f"name=opt/com.coreos/config,file={tmp}/run.ign",
++                                 "-netdev", f"user,id=lab,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
++                                 "-device", "virtio-net-pci,netdev=lab", "-device", "virtio-rng-pci",
++                                 "-sandbox", "on,obsolete=deny,elevateprivileges=deny,resourcecontrol=deny",
++                                 "-display", "none", "-monitor", "none", "-no-reboot",
++                                 "-serial", f"file:{evidence}/serial.log"], cwd=bundle, stdin=sp.DEVNULL,
++                                stdout=diag, stderr=diag, env=dict(os.environ, TMPDIR=str(tmp)))
++
++                def stop_guest():
++                    cleanup["qemu_exit"] = stop(qemu)
++                    cleanup["vm_stopped"] = qemu.poll() is not None
++
++                stack.callback(stop_guest)
+             ssh = ["ssh", "-F", "/dev/null", "-p", str(ssh_port), "-i", str(tmp/"client"),
+                    "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={tmp}/known_hosts",
+@@ -260,9 +290,10 @@ def smoke(bundle, evidence):
+                     return False
+ 
+             until(guest_ready, 600, "pinned SSH and read-only runner media")
+-            tunnel = sp.Popen([*ssh, "-o", "ExitOnForwardFailure=yes", "-N", "-R",
+-                               f"127.0.0.1:5679:127.0.0.1:{broker}", target], stdin=sp.DEVNULL)
+-            stack.callback(stop, tunnel)
++            with defer_sigterm():
++                tunnel = sp.Popen([*ssh, "-o", "ExitOnForwardFailure=yes", "-N", "-R",
++                                   f"127.0.0.1:5679:127.0.0.1:{broker}", target], stdin=sp.DEVNULL)
++                stack.callback(stop, tunnel)
+ 
+             def broker_ready():
+                 if tunnel.poll() is not None:
+@@ -338,4 +369,5 @@ if __name__ == "__main__":
+     parser.add_argument("evidence", type=Path, help="new private evidence directory")
+     args = parser.parse_args()
+     os.umask(0o077)
++    signal.signal(signal.SIGTERM, terminate_on_sigterm)
+     smoke(args.bundle.resolve(), args.evidence.resolve())
+diff --git a/tests/test_smoke_runner.py b/tests/test_smoke_runner.py
+index 02494fe..85ec168 100644
+--- a/tests/test_smoke_runner.py
++++ b/tests/test_smoke_runner.py
+@@ -95,5 +95,76 @@ class MainApiTests(unittest.TestCase):
+         self.assertNotIn("127.0.0.1::5678", commands[0])
+ 
+ 
++class TerminationTests(unittest.TestCase):
++    def test_sigterm_unwinds_main_cleanup_and_records_stop(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            (root / "runner").mkdir()
++            (root / "build").mkdir()
++            shutil.copyfile(ROOT / "runner/smoke-workflow.json", root / "runner/smoke-workflow.json")
++            bundle = root / "bundle"
++            bundle.mkdir()
++            for name in ("runner.iso", "machine.ign", "machine.qcow2"):
++                (bundle / name).touch()
++            evidence = root / "evidence"
++            commands = []
++
++            def command(*args, **kwargs):
++                commands.append(args)
++                if args[:2] == ("podman", "create"):
++                    return "main-container"
++                if args[:2] == ("podman", "port"):
++                    runner.terminate_on_sigterm(runner.signal.SIGTERM, None)
++                if args[:2] == ("podman", "inspect"):
++                    return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
++                return ""
++
++            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command), patch.object(runner.signal, "signal"):
++                with self.assertRaises(SystemExit) as stopped:
++                    runner.smoke(bundle, evidence)
++
++            self.assertEqual(stopped.exception.code, 143)
++            self.assertTrue(json.loads((evidence / "stop.json").read_text())["main_stopped"])
++            self.assertIn(("podman", "stop", "-t", "20", "main-container"), commands)
++            self.assertIn(("podman", "rm", "-v", "main-container"), commands)
++
++    def test_sigterm_during_main_start_waits_for_cleanup_registration(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            (root / "runner").mkdir()
++            (root / "build").mkdir()
++            shutil.copyfile(ROOT / "runner/smoke-workflow.json", root / "runner/smoke-workflow.json")
++            bundle = root / "bundle"
++            bundle.mkdir()
++            for name in ("runner.iso", "machine.ign", "machine.qcow2"):
++                (bundle / name).touch()
++            evidence = root / "evidence"
++            commands = []
++
++            def command(*args, **kwargs):
++                commands.append(args)
++                if args[:2] == ("podman", "create"):
++                    return "main-container"
++                if args[:2] == ("podman", "start"):
++                    runner.signal.getsignal(runner.signal.SIGTERM)(runner.signal.SIGTERM, None)
++                if args[:2] == ("podman", "inspect"):
++                    return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
++                return ""
++
++            previous = runner.signal.getsignal(runner.signal.SIGTERM)
++            runner.signal.signal(runner.signal.SIGTERM, runner.terminate_on_sigterm)
++            try:
++                with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
++                    with self.assertRaises(SystemExit) as stopped:
++                        runner.smoke(bundle, evidence)
++            finally:
++                runner.signal.signal(runner.signal.SIGTERM, previous)
++
++            self.assertEqual(stopped.exception.code, 143)
++            self.assertTrue(json.loads((evidence / "stop.json").read_text())["main_stopped"])
++            self.assertIn(("podman", "stop", "-t", "20", "main-container"), commands)
++            self.assertIn(("podman", "rm", "-v", "main-container"), commands)
++
++
+ if __name__ == "__main__":
+     unittest.main()
