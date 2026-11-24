@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 SITE = "https://sovereign-tasks.vaultsovereign.chatgpt.site"
 DEVICE = "ops-laptop-03"
 PROFILE = "sovereign-linux-n8n-smoke"
-BINDING_HASH = "2abe8e59d9ec54b041e5e3182b45c60feaf03c20d07233bc40956bc65776ae1f"
+BINDING_HASH = "53ae60e8a1dcd1fe197424bf8ff24e765fa6540c006a2063b21bf9e2b15cf8ca"
 PROBE_ID = "smoke_" + "0" * 32
 
 

@@ -102,7 +102,7 @@ A passing `result.json` records one execution, one Code output item, the fixture
 
 ## Local Sovereign Tasks binding
 
-The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against source commit `1ba5f6057181f95fc43c9368cb0350b15259cd1a` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
+The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against source commit `9622edbbcf6831bb8c1506dc4be52dfb597b1180` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
 
 The adapter's `broker_command` maps `run_sovereign_linux_smoke` and `read_sovereign_linux_smoke` to worker operations. Each takes only `request_id` from the owner. The authenticated broker supplies the device and the original claim. The worker reads one bounded JSON command on stdin and returns a JSON response. No socket listener, MCP registration, or service installation is included.
 
