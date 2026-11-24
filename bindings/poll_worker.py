@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 SITE = "https://sovereign-tasks.vaultsovereign.chatgpt.site"
 DEVICE = "ops-laptop-03"
 PROFILE = "sovereign-linux-n8n-smoke"
-BINDING_HASH = "7e5aecae6560d1937743757afed6f229d85bc25d91b08de8cade0763f9913587"
+BINDING_HASH = "2abe8e59d9ec54b041e5e3182b45c60feaf03c20d07233bc40956bc65776ae1f"
 PROBE_ID = "smoke_" + "0" * 32
 
 
@@ -62,7 +62,8 @@ def tick(binding, post):
         raise ValueError("Reserved read probe has local state")
     answer = post("poll", dict(profile=PROFILE, device_id=DEVICE, revision=binding["REVISION"],
                                manifest=binding["MANIFEST"], probe="not_found"))
-    if set(answer) != {"command", "probe"} or answer["probe"] != "not_found":
+    if (not isinstance(answer, dict) or set(answer) != {"command", "probe"}
+            or answer["probe"] != "not_found"):
         raise ValueError("Unexpected signed-poll response")
     cmd = answer["command"]
     if cmd is None:
@@ -74,7 +75,9 @@ def tick(binding, post):
     if result["state"] == "not_found":
         # An interrupted claim can lose its first delivery. Never convert status to run.
         result["state"] = "uncertain"
-    if post("report", result) != {"accepted": True}:
+    acknowledgement = post("report", result)
+    if (not isinstance(acknowledgement, dict) or set(acknowledgement) != {"accepted"}
+            or acknowledgement["accepted"] is not True):
         raise ValueError("Report unacknowledged")
     return True
 

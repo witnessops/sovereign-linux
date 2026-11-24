@@ -78,7 +78,7 @@ machine=$(bash scripts/build-local.sh "$base" /path/to/runner-image.tar) &&
   (cd "$machine" && sha256sum -c SHA256SUMS)
 ```
 
-For one attended test on Linux, the host needs Python 3, rootless Podman, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network with loopback-only published ports. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
+For one attended test on Linux, the host needs Python 3, rootless Podman, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network. Only its broker port is published on host loopback; the harness calls the main API from inside the container. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
 
 ```bash
 python3 scripts/smoke-runner.py "$machine" build/my-first-run-evidence
@@ -90,7 +90,7 @@ A passing `result.json` records one execution, one Code output item, the fixture
 
 ## Local Sovereign Tasks binding
 
-The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against build commit `08b05d4d4ed728fcb8d998eec75b3e81657eab2b` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
+The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against source commit `1ba5f6057181f95fc43c9368cb0350b15259cd1a` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
 
 The adapter's `broker_command` maps `run_sovereign_linux_smoke` and `read_sovereign_linux_smoke` to worker operations. Each takes only `request_id` from the owner. The authenticated broker supplies the device and the original claim. The worker reads one bounded JSON command on stdin and returns a JSON response. No socket listener, MCP registration, or service installation is included.
 
