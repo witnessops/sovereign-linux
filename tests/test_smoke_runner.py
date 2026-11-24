@@ -14,18 +14,23 @@ runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 
 
+STORE = runner.PodmanStore("1" * 64, Path("/test/networks"))
+CONTAINER_ID = "c" * 64
+
+
 class HostPreflightTests(unittest.TestCase):
     def test_root_host_is_refused_before_podman_access(self):
         with patch.object(runner.os, "geteuid", return_value=0), patch.object(runner, "run") as command:
             with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
-                runner.require_rootless_host()
+                runner.rootless_store()
         command.assert_not_called()
 
     def test_rootful_podman_is_refused(self):
-        with patch.object(runner.os, "geteuid", return_value=1000), patch.object(runner, "run", return_value="false") as command:
+        with patch.object(runner.os, "geteuid", return_value=1000), patch.object(runner, "run", return_value=json.dumps({
+                "host": {"security": {"rootless": False}}, "store": {}})) as command:
             with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
-                runner.require_rootless_host()
-        command.assert_called_once_with("podman", "info", "--format", "{{.Host.Security.Rootless}}")
+                runner.rootless_store()
+        command.assert_called_once_with("podman", "info", "--format", "json", timeout=10)
 
     def test_host_check_precedes_evidence_creation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -34,7 +39,7 @@ class HostPreflightTests(unittest.TestCase):
             for name in ("runner.iso", "machine.ign", "machine.qcow2"):
                 (bundle / name).touch()
             evidence = Path(temp) / "evidence"
-            with patch.object(runner, "run"), patch.object(runner, "require_rootless_host", side_effect=RuntimeError("rootless Podman")):
+            with patch.object(runner, "run"), patch.object(runner, "rootless_store", side_effect=RuntimeError("rootless Podman")):
                 with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
                     runner.smoke(bundle, evidence)
             self.assertFalse(evidence.exists())
@@ -48,7 +53,7 @@ class MainApiTests(unittest.TestCase):
             {"status": 200, "cookies": [], "body": json.dumps({"data": {"workflows": []}})},
         ]
         with patch.object(runner, "run", side_effect=[json.dumps(reply) for reply in replies]) as command:
-            api = runner.MainApi("main-container")
+            api = runner.MainApi("main-container", STORE)
             self.assertEqual(api.request("/owner/setup", {"password": "private-password"}), {"owner": True})
             self.assertEqual(api.request("/workflows/"), {"workflows": []})
 
@@ -62,7 +67,7 @@ class MainApiTests(unittest.TestCase):
         reply = {"status": 404, "cookies": [], "body": "missing"}
         with patch.object(runner, "run", return_value=json.dumps(reply)):
             with self.assertRaises(HTTPError) as error:
-                runner.MainApi("main-container").request("/executions/1")
+                runner.MainApi("main-container", STORE).request("/executions/1")
         self.assertEqual(error.exception.code, 404)
 
     def test_main_ui_is_not_published_on_host(self):
@@ -86,7 +91,12 @@ class MainApiTests(unittest.TestCase):
                     raise StopAtCreate
                 return ""
 
-            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
+            with (
+                patch.object(runner, "REPO", root),
+                patch.object(runner, "rootless_store", return_value=STORE),
+                patch.object(runner, "inspect_resource", return_value={"state": "owned", "id": "a" * 64}),
+                patch.object(runner, "run", side_effect=command),
+            ):
                 with self.assertRaises(StopAtCreate):
                     runner.smoke(bundle, root / "evidence")
 
@@ -112,21 +122,27 @@ class TerminationTests(unittest.TestCase):
             def command(*args, **kwargs):
                 commands.append(args)
                 if args[:2] == ("podman", "create"):
-                    return "main-container"
+                    return CONTAINER_ID
                 if args[:2] == ("podman", "port"):
                     runner.terminate_on_sigterm(runner.signal.SIGTERM, None)
                 if args[:2] == ("podman", "inspect"):
-                    return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
+                    return "false" if ("podman", "stop", "-t", "20", CONTAINER_ID) in commands else "true"
                 return ""
 
-            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command), patch.object(runner.signal, "signal"):
+            with (
+                patch.object(runner, "REPO", root),
+                patch.object(runner, "rootless_store", return_value=STORE),
+                patch.object(runner, "inspect_resource", return_value={"state": "owned", "id": "a" * 64}),
+                patch.object(runner, "run", side_effect=command),
+                patch.object(runner.signal, "signal"),
+            ):
                 with self.assertRaises(SystemExit) as stopped:
                     runner.smoke(bundle, evidence)
 
             self.assertEqual(stopped.exception.code, 143)
             self.assertTrue(json.loads((evidence / "stop.json").read_text())["main_stopped"])
-            self.assertIn(("podman", "stop", "-t", "20", "main-container"), commands)
-            self.assertIn(("podman", "rm", "-v", "main-container"), commands)
+            self.assertIn(("podman", "stop", "-t", "20", CONTAINER_ID), commands)
+            self.assertIn(("podman", "rm", "-v", CONTAINER_ID), commands)
 
     def test_sigterm_during_main_start_waits_for_cleanup_registration(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -144,17 +160,22 @@ class TerminationTests(unittest.TestCase):
             def command(*args, **kwargs):
                 commands.append(args)
                 if args[:2] == ("podman", "create"):
-                    return "main-container"
+                    return CONTAINER_ID
                 if args[:2] == ("podman", "start"):
                     runner.signal.getsignal(runner.signal.SIGTERM)(runner.signal.SIGTERM, None)
                 if args[:2] == ("podman", "inspect"):
-                    return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
+                    return "false" if ("podman", "stop", "-t", "20", CONTAINER_ID) in commands else "true"
                 return ""
 
             previous = runner.signal.getsignal(runner.signal.SIGTERM)
             runner.signal.signal(runner.signal.SIGTERM, runner.terminate_on_sigterm)
             try:
-                with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
+                with (
+                    patch.object(runner, "REPO", root),
+                    patch.object(runner, "rootless_store", return_value=STORE),
+                    patch.object(runner, "inspect_resource", return_value={"state": "owned", "id": "a" * 64}),
+                    patch.object(runner, "run", side_effect=command),
+                ):
                     with self.assertRaises(SystemExit) as stopped:
                         runner.smoke(bundle, evidence)
             finally:
@@ -162,8 +183,8 @@ class TerminationTests(unittest.TestCase):
 
             self.assertEqual(stopped.exception.code, 143)
             self.assertTrue(json.loads((evidence / "stop.json").read_text())["main_stopped"])
-            self.assertIn(("podman", "stop", "-t", "20", "main-container"), commands)
-            self.assertIn(("podman", "rm", "-v", "main-container"), commands)
+            self.assertIn(("podman", "stop", "-t", "20", CONTAINER_ID), commands)
+            self.assertIn(("podman", "rm", "-v", CONTAINER_ID), commands)
 
 
 if __name__ == "__main__":

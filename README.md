@@ -78,7 +78,7 @@ machine=$(bash scripts/build-local.sh "$base" /path/to/runner-image.tar) &&
   (cd "$machine" && sha256sum -c SHA256SUMS)
 ```
 
-For one attended test on Linux, the host needs Python 3, rootless Podman, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network. Only its broker port is published on host loopback; the harness calls the main API from inside the container. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
+For one attended test on Linux, the host needs Python 3, rootless Podman with Netavark, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network. Only its broker port is published on host loopback; the harness calls the main API from inside the container. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
 
 ```bash
 python3 scripts/smoke-runner.py "$machine" build/my-first-run-evidence
@@ -86,11 +86,27 @@ python3 scripts/smoke-runner.py "$machine" build/my-first-run-evidence
 
 The evidence path must be new. The harness records dispatch intent before submitting the inactive fixture's manual trigger. If a submitted run is interrupted, use its recorded workflow and execution IDs to inspect the saved result before considering another run. Choosing a new directory requests a new execution.
 
+### Inspect host resources after an interruption
+
+Before creating the rootless network or main container, the harness saves `resource-intent.json` in the private request directory. Both objects carry the same request ID and a fresh attempt label. After creating the network, the harness verifies its name and both labels, then uses its full network ID for container attachment and cleanup. If ownership or a creation-specific ID cannot be verified, startup stops and the intent remains available for inspection. From the same rootless Podman account and store, inspect the original evidence directory with:
+
+```bash
+python3 -I scripts/smoke-runner.py --inspect-resources "$evidence"
+```
+
+Set `evidence` to the original request directory. The JSON snapshot reports each resource as `owned` with its full Podman ID when the generated name and both labels match, `foreign` for a label mismatch, `absent` for a negative existence check, or `unknown` for an inconclusive lookup. Older evidence without an ownership record and invalid records produce `unknown` before Podman is queried. The command exits zero when both lookups return `owned` or `absent`; other outcomes exit nonzero.
+
+The smoke profile requires local rootless Netavark. Preflight checks the backend before creating smoke resources. The harness explicitly pins every host resource operation to the resolved Netavark directory at `<graphRoot>/networks`. It records that path and includes the directory's device and inode in the store fingerprint alongside the machine, UID, graph root, run root, storage driver and backend. Inspection checks the binding before and after reading the inventory. A replaced directory or a legacy record without a directory binding yields `unknown`.
+
+A timed-out container create may already have attached the container to the network. Once create begins, the harness preserves the network until it receives a full container ID and Podman confirms removal of that container. When cleanup runs with the attachment still uncertain, `stop.json` records `"network_cleanup": "deferred"`. Use read-only inspection with the original request to reconcile the resources.
+
+Inspection reads the current inventory. A pending create can still finish after an `absent` observation. Keep the worker reservation and use the existing dispatch and execution receipts to determine workflow status. The inspector never performs cleanup, dispatches work or changes the ledger. The labels identify runs within the trusted rootless account; anyone with control of that account can copy them.
+
 A passing `result.json` records one execution, one Code output item, the fixture marker, and integer `42`. The harness compares the execution API response with the stopped main's SQLite database. It also records VM and main shutdown. The gitignored private database directory is identified in `dispatch-intent.json`. It contains synthetic account and session data and should stay local.
 
 ## Local Sovereign Tasks binding
 
-The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against source commit `1ba5f6057181f95fc43c9368cb0350b15259cd1a` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
+The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against source commit `eb382ec07dfe902d44b09e3ca8288329f0cc64fc` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
 
 The adapter's `broker_command` maps `run_sovereign_linux_smoke` and `read_sovereign_linux_smoke` to worker operations. Each takes only `request_id` from the owner. The authenticated broker supplies the device and the original claim. The worker reads one bounded JSON command on stdin and returns a JSON response. No socket listener, MCP registration, or service installation is included.
 

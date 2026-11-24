@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import socket
@@ -14,6 +15,7 @@ import sqlite3
 import subprocess as sp
 import tempfile
 import time
+from typing import NamedTuple
 from urllib.error import HTTPError
 
 REPO = Path(__file__).resolve().parents[1]
@@ -21,6 +23,8 @@ MAIN = "0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2"
 RUNNER = "8045f3fa0f22bb5e140133c95bebed0f7293867a0b3a47a1dc5453b0d61ea689"
 FIXTURE = "500d50173083a1b3fb699f2c3099b1dd0bc3a866b481a40f0e68c60fc06fad91"
 MARKER = "wops-vm-smoke-20261113"
+REQUEST_LABEL = "io.sovereignlinux.smoke.request"
+ATTEMPT_LABEL = "io.sovereignlinux.smoke.attempt"
 MAIN_API_CLIENT = """
 const http = require('node:http');
 let input = '';
@@ -55,20 +59,26 @@ process.stdin.on('end', () => {
 """
 
 
-def run(*args, timeout=90, **kwargs):
+def run(*args, timeout=90, network_config_dir=None, **kwargs):
+    if args[0] == "podman":
+        options = ["--remote=false"]
+        if network_config_dir is not None:
+            options.append(f"--network-config-dir={network_config_dir}")
+        args = ("podman", *options, *args[1:])
     return sp.run(args, text=True, stdout=sp.PIPE, check=True, timeout=timeout, **kwargs).stdout.strip()
 
 
 class MainApi:
-    def __init__(self, container):
+    def __init__(self, container, store):
+        self.store = store
         self.container = container
         self.cookies = {}
 
     def request(self, path, body=None):
         frame = {"path": path, "body": body,
                  "cookie": "; ".join(f"{name}={value}" for name, value in self.cookies.items())}
-        raw = run("podman", "exec", "-i", self.container, "node", "-e", MAIN_API_CLIENT,
-                  input=json.dumps(frame), timeout=15)
+        raw = self.store.podman("exec", "-i", self.container, "node", "-e", MAIN_API_CLIENT,
+                                input=json.dumps(frame), timeout=15)
         response = json.loads(raw)
         if (not isinstance(response, dict) or type(response.get("status")) is not int
                 or not isinstance(response.get("cookies"), list)
@@ -178,9 +188,134 @@ def saved_result(serialized):
     return {"code_runs": len(runs), "items": len(items), "marker": MARKER, "result": number}
 
 
-def require_rootless_host():
-    if os.geteuid() == 0 or run("podman", "info", "--format", "{{.Host.Security.Rootless}}") != "true":
+class PodmanStore(NamedTuple):
+    fingerprint: str
+    network_dir: Path
+
+    def check_current(self):
+        if rootless_store() != self:
+            raise RuntimeError("Podman store changed before cleanup")
+
+    def podman(self, *args, **kwargs):
+        return run("podman", *args, network_config_dir=self.network_dir, **kwargs)
+
+
+def rootless_store(*, prepare=False):
+    uid = os.geteuid()
+    if uid == 0:
         raise RuntimeError("The host n8n main requires rootless Podman")
+    info = json.loads(run("podman", "info", "--format", "json", timeout=10))
+    host, store = info["host"], info["store"]
+    if host["security"]["rootless"] is not True or host["serviceIsRemote"] is not False:
+        raise RuntimeError("The host n8n main requires local rootless Podman")
+    if host.get("networkBackend") != "netavark":
+        raise RuntimeError("The smoke profile requires the Netavark network backend")
+    root = Path(store["graphRoot"])
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError("Expected a local Podman graph root directory")
+    root = root.resolve(strict=True)
+    meta = root.stat()
+    machine = Path("/etc/machine-id").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", machine):
+        raise ValueError("Unavailable local machine identity")
+    network_dir = root / "networks"
+    if prepare:
+        network_dir.mkdir(mode=0o700, exist_ok=True)
+    network_dir = network_dir.resolve(strict=True)
+    if not network_dir.is_dir():
+        raise ValueError("Expected a Netavark configuration directory")
+    network_meta = network_dir.stat()
+    identity = [machine, uid, str(root), meta.st_dev, meta.st_ino, store["runRoot"],
+                store["graphDriverName"], host["networkBackend"],
+                str(network_dir), network_meta.st_dev, network_meta.st_ino]
+    return PodmanStore(hashlib.sha256(json.dumps(identity).encode()).hexdigest(), network_dir)
+
+
+def request_id_for(evidence):
+    if re.fullmatch(r"smoke_[0-9a-f]{32}", evidence.name):
+        return evidence.name
+    # Standalone callers can choose arbitrary directory names. Keep them off Podman labels.
+    return "local_" + hashlib.sha256(os.fsencode(evidence.name)).hexdigest()
+
+
+def save_resource_intent(evidence, name, store):
+    intent = {"request_id": request_id_for(evidence), "name": name, "attempt": secrets.token_hex(16),
+              "store_id": store.fingerprint, "network_config_dir": str(store.network_dir)}
+    record(evidence / "resource-intent.json", intent)
+    for directory in (evidence, evidence.parent):
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return intent
+
+
+def inspect_resource(kind, intent, store):
+    name = intent["name"]
+    try:
+        store.podman(kind, "exists", name, timeout=10, stderr=sp.DEVNULL)
+    except sp.CalledProcessError as error:
+        if error.returncode == 1:
+            return {"state": "absent"}
+        raise
+
+    label_field = ".Config.Labels" if kind == "container" else ".Labels"
+    fields = "{{.Name}} {{.ID}} {{json " + label_field + "}}"
+    raw = store.podman(kind, "inspect", "--format", fields, name, timeout=10, stderr=sp.DEVNULL)
+    actual_name, resource_id, raw_labels = raw.split(" ", 2)
+    labels = json.loads(raw_labels)
+    if actual_name != name or not re.fullmatch(r"[0-9a-f]{64}", resource_id):
+        return {"state": "unknown", "reason": "unexpected_identity"}
+    if labels is not None and not isinstance(labels, dict):
+        return {"state": "unknown", "reason": "invalid_labels"}
+    if (not labels or labels.get(REQUEST_LABEL) != intent["request_id"]
+            or labels.get(ATTEMPT_LABEL) != intent["attempt"]):
+        return {"state": "foreign"}
+    return {"state": "owned", "id": resource_id}
+
+
+def remove_network(network_id, store):
+    store.check_current()
+    try:
+        store.podman("network", "rm", network_id)
+    except sp.CalledProcessError as error:
+        # For one full network ID, exit 1 means the original is already gone.
+        if error.returncode != 1:
+            raise
+
+
+def inspect_resources(evidence):
+    request_id = request_id_for(evidence)
+    try:
+        intent = json.loads((evidence / "resource-intent.json").read_bytes())
+    except FileNotFoundError:
+        return {"request_id": request_id, "state": "unknown", "reason": "missing_intent"}
+    except (OSError, ValueError):
+        intent = None
+    if (not isinstance(intent, dict) or intent.get("request_id") != request_id
+            or not isinstance(intent.get("name"), str) or not re.fullmatch(r"sovereign-smoke-[0-9a-f]{12}", intent["name"])
+            or not isinstance(intent.get("attempt"), str) or not re.fullmatch(r"[0-9a-f]{32}", intent["attempt"])):
+        return {"request_id": request_id, "state": "unknown", "reason": "invalid_intent"}
+
+    if not isinstance(intent.get("store_id"), str) or not re.fullmatch(r"[0-9a-f]{64}", intent["store_id"]):
+        return {"request_id": request_id, "state": "unknown", "reason": "unverified_store"}
+    if not isinstance(intent.get("network_config_dir"), str) or not Path(intent["network_config_dir"]).is_absolute():
+        return {"request_id": request_id, "state": "unknown", "reason": "unverified_network_config"}
+    try:
+        store = rootless_store()
+        if store.fingerprint == intent["store_id"] and str(store.network_dir) == intent["network_config_dir"]:
+            resources = {}
+            for kind in ("container", "network"):
+                try:
+                    resources[kind] = inspect_resource(kind, intent, store)
+                except (OSError, ValueError, sp.SubprocessError):
+                    resources[kind] = {"state": "unknown", "reason": "inspection_failed"}
+            if rootless_store() == store:
+                return {"request_id": request_id, "resources": resources}
+        return {"request_id": request_id, "state": "unknown", "reason": "store_mismatch"}
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, sp.SubprocessError):
+        return {"request_id": request_id, "state": "unknown", "reason": "rootless_host_unavailable"}
 
 
 def smoke(bundle, evidence):
@@ -191,9 +326,12 @@ def smoke(bundle, evidence):
         if not (bundle / name).is_file():
             raise ValueError("Missing bundle file: " + name)
     run("sha256sum", "-c", "SHA256SUMS", cwd=bundle)
-    require_rootless_host()
+    store = rootless_store(prepare=True)
     evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     name = "sovereign-smoke-" + secrets.token_hex(6)
+    intent = save_resource_intent(evidence, name, store)
+    labels = ["--label", f"{REQUEST_LABEL}={intent['request_id']}",
+              "--label", f"{ATTEMPT_LABEL}={intent['attempt']}"]
     db_dir = REPO / "build" / name
     db_dir.mkdir(mode=0o700)
     print("Private SQLite directory:", db_dir, flush=True)
@@ -204,8 +342,22 @@ def smoke(bundle, evidence):
             tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="sovereign-smoke-")))
             # Keep the database after shutdown for independent, read-only verification.
             with defer_sigterm():
-                run("podman", "network", "create", "--internal", name)
-                stack.callback(run, "podman", "network", "rm", name)
+                store.podman("network", "create", "--internal", *labels, name)
+                network = inspect_resource("network", intent, store)
+                if network["state"] != "owned":
+                    raise RuntimeError("Could not verify the new network's ownership")
+                network_id = network["id"]
+                if network_id == hashlib.sha256(name.encode()).hexdigest():
+                    raise RuntimeError("Podman returned a name-derived network ID")
+                network_removal_safe = True
+
+                def cleanup_network():
+                    if network_removal_safe:
+                        remove_network(network_id, store)
+                    else:
+                        cleanup["network_cleanup"] = "deferred"
+
+                stack.callback(cleanup_network)
             env = dict(os.environ, N8N_RUNNERS_AUTH_TOKEN=token, N8N_ENCRYPTION_KEY=secrets.token_hex(32))
             settings = ["N8N_RUNNERS_MODE=external", "N8N_RUNNERS_ENABLED=true",
                         "N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0", "N8N_RUNNERS_MAX_CONCURRENCY=1",
@@ -217,20 +369,32 @@ def smoke(bundle, evidence):
                         "N8N_PERSONALIZATION_ENABLED=false", "N8N_RUNNERS_AUTH_TOKEN", "N8N_ENCRYPTION_KEY"]
             env_args = [arg for setting in settings for arg in ("-e", setting)]
             with defer_sigterm():
-                cid = run("podman", "create", "--pull=never", "--name", name, "--network", name,
-                          "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
-                          "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
-                stack.callback(run, "podman", "rm", "-v", cid)
+                # Podman may persist the attachment before returning a container ID.
+                network_removal_safe = False
+                cid = store.podman("create", "--pull=never", *labels, "--name", name, "--network", network_id,
+                                   "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
+                                   "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
+                if not re.fullmatch(r"[0-9a-f]{64}", cid):
+                    raise RuntimeError("Container create returned no valid full ID")
+
+                def remove_main():
+                    nonlocal network_removal_safe
+                    store.check_current()
+                    store.podman("rm", "-v", cid)
+                    network_removal_safe = True
+
+                stack.callback(remove_main)
 
                 def stop_main():
-                    if run("podman", "inspect", "--format", "{{.State.Running}}", cid) == "true":
-                        run("podman", "stop", "-t", "20", cid)
-                    cleanup["main_stopped"] = run("podman", "inspect", "--format", "{{.State.Running}}", cid) == "false"
+                    store.check_current()
+                    if store.podman("inspect", "--format", "{{.State.Running}}", cid) == "true":
+                        store.podman("stop", "-t", "20", cid)
+                    cleanup["main_stopped"] = store.podman("inspect", "--format", "{{.State.Running}}", cid) == "false"
 
                 stack.callback(stop_main)
-                run("podman", "start", cid)
-            broker = int(run("podman", "port", cid, "5679").split(":")[-1])
-            request = MainApi(cid).request
+                store.podman("start", cid)
+            broker = int(store.podman("port", cid, "5679").split(":")[-1])
+            request = MainApi(cid, store).request
 
             def settings_ready():
                 try:
@@ -339,7 +503,7 @@ def smoke(bundle, evidence):
             if str(execution["id"]) != str(eid) or execution["workflowId"] != wid or execution["status"] != "success" or execution["finished"] is not True:
                 raise RuntimeError("Execution failed its saved API readback: " + execution["status"])
             api_result = saved_result(execution["data"])
-            logs = run("podman", "logs", "--timestamps", cid, stderr=sp.STDOUT)
+            logs = store.podman("logs", "--timestamps", cid, stderr=sp.STDOUT)
             registrations = [line.strip() for line in logs.splitlines()
                              if 'Registered runner "JS Task Runner"' in line
                              or 'Registered runner "launcher-javascript"' in line]
@@ -365,9 +529,18 @@ def smoke(bundle, evidence):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("bundle", type=Path, nargs="?")
+    mode.add_argument("--inspect-resources", action="store_true",
+                      help="read the ownership record and current rootless Podman resources")
     parser.add_argument("evidence", type=Path, help="new private evidence directory")
     args = parser.parse_args()
     os.umask(0o077)
+    if args.inspect_resources:
+        snapshot = inspect_resources(args.evidence.absolute())
+        print(json.dumps(snapshot, sort_keys=True))
+        resources = snapshot.get("resources", {})
+        raise SystemExit(0 if resources and all(item["state"] in ("owned", "absent")
+                                                for item in resources.values()) else 1)
     signal.signal(signal.SIGTERM, terminate_on_sigterm)
     smoke(args.bundle.resolve(), args.evidence.resolve())
