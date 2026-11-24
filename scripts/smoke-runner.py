@@ -96,6 +96,11 @@ def saved_result(serialized):
     return {"code_runs": len(runs), "items": len(items), "marker": MARKER, "result": number}
 
 
+def require_rootless_host():
+    if os.geteuid() == 0 or run("podman", "info", "--format", "{{.Host.Security.Rootless}}") != "true":
+        raise RuntimeError("The host n8n main requires rootless Podman")
+
+
 def smoke(bundle, evidence):
     fixture = (REPO / "runner/smoke-workflow.json").read_bytes()
     if hashlib.sha256(fixture).hexdigest() != FIXTURE:
@@ -104,6 +109,7 @@ def smoke(bundle, evidence):
         if not (bundle / name).is_file():
             raise ValueError("Missing bundle file: " + name)
     run("sha256sum", "-c", "SHA256SUMS", cwd=bundle)
+    require_rootless_host()
     evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     name = "sovereign-smoke-" + secrets.token_hex(6)
     db_dir = REPO / "build" / name
