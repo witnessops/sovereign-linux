@@ -1,0 +1,105 @@
+diff --git a/README.md b/README.md
+index 0b00ae1..433718a 100644
+--- a/README.md
++++ b/README.md
+@@ -78,7 +78,7 @@ machine=$(bash scripts/build-local.sh "$base" /path/to/runner-image.tar) &&
+   (cd "$machine" && sha256sum -c SHA256SUMS)
+ ```
+ 
+-For one attended test on Linux, the host needs Python 3, rootless Podman, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network with loopback-only published ports. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
++For one attended test on Linux, the host needs Python 3, rootless Podman, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network. Only its broker port is published on host loopback; the harness calls the main API from inside the container. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
+ 
+ ```bash
+ python3 scripts/smoke-runner.py "$machine" build/my-first-run-evidence
+@@ -90,7 +90,7 @@ A passing `result.json` records one execution, one Code output item, the fixture
+ 
+ ## Local Sovereign Tasks binding
+ 
+-The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against build commit `08b05d4d4ed728fcb8d998eec75b3e81657eab2b` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
++The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against source commit `1ba5f6057181f95fc43c9368cb0350b15259cd1a` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
+ 
+ The adapter's `broker_command` maps `run_sovereign_linux_smoke` and `read_sovereign_linux_smoke` to worker operations. Each takes only `request_id` from the owner. The authenticated broker supplies the device and the original claim. The worker reads one bounded JSON command on stdin and returns a JSON response. No socket listener, MCP registration, or service installation is included.
+ 
+diff --git a/bindings/poll_worker.py b/bindings/poll_worker.py
+index a81b0d3..344235a 100644
+--- a/bindings/poll_worker.py
++++ b/bindings/poll_worker.py
+@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
+ SITE = "https://sovereign-tasks.vaultsovereign.chatgpt.site"
+ DEVICE = "ops-laptop-03"
+ PROFILE = "sovereign-linux-n8n-smoke"
+-BINDING_HASH = "7e5aecae6560d1937743757afed6f229d85bc25d91b08de8cade0763f9913587"
++BINDING_HASH = "2abe8e59d9ec54b041e5e3182b45c60feaf03c20d07233bc40956bc65776ae1f"
+ PROBE_ID = "smoke_" + "0" * 32
+ 
+ 
+@@ -62,7 +62,8 @@ def tick(binding, post):
+         raise ValueError("Reserved read probe has local state")
+     answer = post("poll", dict(profile=PROFILE, device_id=DEVICE, revision=binding["REVISION"],
+                                manifest=binding["MANIFEST"], probe="not_found"))
+-    if set(answer) != {"command", "probe"} or answer["probe"] != "not_found":
++    if (not isinstance(answer, dict) or set(answer) != {"command", "probe"}
++            or answer["probe"] != "not_found"):
+         raise ValueError("Unexpected signed-poll response")
+     cmd = answer["command"]
+     if cmd is None:
+@@ -74,7 +75,9 @@ def tick(binding, post):
+     if result["state"] == "not_found":
+         # An interrupted claim can lose its first delivery. Never convert status to run.
+         result["state"] = "uncertain"
+-    if post("report", result) != {"accepted": True}:
++    acknowledgement = post("report", result)
++    if (not isinstance(acknowledgement, dict) or set(acknowledgement) != {"accepted"}
++            or acknowledgement["accepted"] is not True):
+         raise ValueError("Report unacknowledged")
+     return True
+ 
+diff --git a/bindings/sovereign_smoke.py b/bindings/sovereign_smoke.py
+index 64b4aa0..2d05f1c 100644
+--- a/bindings/sovereign_smoke.py
++++ b/bindings/sovereign_smoke.py
+@@ -14,7 +14,7 @@ from pathlib import Path
+ REPO = Path(__file__).resolve().parents[1]
+ PROFILE = "sovereign-linux-n8n-smoke"
+ DEVICE = "ops-laptop-03"
+-REVISION = "08b05d4d4ed728fcb8d998eec75b3e81657eab2b"
++REVISION = "1ba5f6057181f95fc43c9368cb0350b15259cd1a"
+ BUNDLE = REPO / "build/machine.PToCA9g4"
+ MANIFEST = "1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428"
+ FIXTURE = "500d50173083a1b3fb699f2c3099b1dd0bc3a866b481a40f0e68c60fc06fad91"
+diff --git a/tests/test_poll_worker.py b/tests/test_poll_worker.py
+index a20b732..4196463 100644
+--- a/tests/test_poll_worker.py
++++ b/tests/test_poll_worker.py
+@@ -9,6 +9,31 @@ binding = runpy.run_path(str(ROOT / 'bindings/sovereign_smoke.py'))
+ 
+ 
+ class WorkerTests(unittest.TestCase):
++    def test_poll_rejects_non_object_responses(self):
++        for answer in (None, 1, [], "unexpected"):
++            with self.subTest(answer=answer):
++                handle = Mock(return_value={"state": "not_found"})
++                post = Mock(return_value=answer)
++                with self.assertRaisesRegex(ValueError, "Unexpected signed-poll response"):
++                    worker["tick"]({**binding, "handle": handle}, post)
++                handle.assert_called_once()
++                post.assert_called_once()
++
++    def test_report_requires_exact_boolean_acknowledgement(self):
++        command = binding["broker_command"](
++            "read_sovereign_linux_smoke", {"request_id": "smoke_" + "a" * 32},
++            device_id=worker["DEVICE"], claim_id="claim_" + "b" * 32,
++        )
++        for acknowledgement in ({"accepted": 1}, {"accepted": False},
++                                {"accepted": True, "extra": 1}, None):
++            with self.subTest(acknowledgement=acknowledgement):
++                handle = Mock(side_effect=[{"state": "not_found"}, {"state": "running"}])
++                post = Mock(side_effect=[{"command": command, "probe": "not_found"}, acknowledgement])
++                with self.assertRaisesRegex(ValueError, "Report unacknowledged"):
++                    worker["tick"]({**binding, "handle": handle}, post)
++                self.assertEqual(handle.call_count, 2)
++                self.assertEqual(post.call_count, 2)
++
+     def test_idle_poll_performs_only_local_read(self):
+         handle = Mock(return_value={'state': 'not_found'})
+         post = Mock(return_value={'command':None,'probe':'not_found'})

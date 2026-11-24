@@ -1,0 +1,11 @@
+[Unit]
+Description=Read-only Sovereign Linux n8n runner media
+
+[Mount]
+What=/dev/disk/by-label/SOVRUNNER
+Where=/var/mnt/runner
+Type=iso9660
+Options=ro,nodev,nosuid,noexec
+
+[Install]
+WantedBy=multi-user.target
