@@ -23,7 +23,7 @@ def load(name, path):
 
 worker = load("binding", "bindings/sovereign_smoke.py")
 runner = load("runner", "scripts/smoke-runner.py")
-STORE = "1" * 64
+STORE = runner.PodmanStore("1" * 64, Path("/test/networks"))
 NETWORK_ID = "a" * 64
 
 
@@ -41,6 +41,7 @@ def model_child(case, root, evidence):
     def command(*args, **kwargs):
         if args == ("sha256sum", "-c", "SHA256SUMS"):
             return ""
+        assert kwargs.get("network_config_dir") == STORE.network_dir
         if args[:3] == ("podman", "network", "create"):
             assert json.loads((evidence / "resource-intent.json").read_text())["name"] == args[-1]
             (engine / "network").write_text(json.dumps(args[3:]))
@@ -59,8 +60,9 @@ def model_child(case, root, evidence):
         if args[:3] == ("podman", "network", "rm"):
             assert args[-1] == NETWORK_ID
             (engine / "network-rm-attempt").touch()
-            if (engine / "container").exists():
-                raise subprocess.CalledProcessError(125, args, stderr="network in use")
+            # Model an engine that accepts ID-based removal even with a surviving attachment.
+            (engine / "network").unlink()
+            return ""
         raise AssertionError(f"Unexpected command: {args[:3]}")
 
     if case == "lost-ack":
@@ -75,12 +77,11 @@ def model_child(case, root, evidence):
         os.kill(os.getpid(), signal.SIGKILL)
 
     with patch.object(runner, "REPO", root), patch.object(runner, "run", side_effect=command), \
-            patch.object(runner, "rootless_store_id", return_value=STORE):
+            patch.object(runner, "rootless_store", return_value=STORE):
         try:
             runner.smoke(root / "bundle", evidence)
-        except subprocess.CalledProcessError as error:
-            if (case == "timeout" and isinstance(error.__context__, subprocess.TimeoutExpired)
-                    and error.cmd[:3] == ("podman", "network", "rm")):
+        except subprocess.TimeoutExpired:
+            if case == "timeout":
                 return 75
             raise
     raise AssertionError("Interruption did not occur")
@@ -136,9 +137,9 @@ class RecoveryTests(unittest.TestCase):
         intent = json.loads((self.evidence / "resource-intent.json").read_text())
         self.assertEqual(intent["request_id"], self.request)
         self.assertNotIn("triggers", resources)
-        self.assertEqual("network-rm-attempt" in resources, case == "timeout")
+        self.assertNotIn("network-rm-attempt", resources)
         if case == "timeout":
-            self.assertEqual(json.loads((self.evidence / "stop.json").read_text()), {})
+            self.assertEqual(json.loads((self.evidence / "stop.json").read_text()), {"network_cleanup": "deferred"})
         else:
             self.assertFalse((self.evidence / "stop.json").exists())
 
@@ -152,6 +153,7 @@ class RecoveryTests(unittest.TestCase):
             inventory[kind] = (name, resource_id, labels)
 
         def read(*args, **kwargs):
+            self.assertEqual(kwargs.get("network_config_dir"), STORE.network_dir)
             binary, kind, action, *fields, name = args
             self.assertEqual((binary, name), ("podman", inventory[kind][0]))
             if action == "exists":
@@ -165,7 +167,7 @@ class RecoveryTests(unittest.TestCase):
         def snapshot():
             return runner.inspect_resources(self.evidence)["resources"]
 
-        with patch.object(runner, "rootless_store_id", return_value=STORE), patch.object(runner, "run", side_effect=read):
+        with patch.object(runner, "rootless_store", return_value=STORE), patch.object(runner, "run", side_effect=read):
             expected = {k: {"state": "owned", "id": item[1]} for k, item in inventory.items()}
             self.assertEqual(snapshot(), expected)
             self.assertEqual(snapshot(), expected)
@@ -178,7 +180,7 @@ class RecoveryTests(unittest.TestCase):
     def test_legacy_partial_and_swapped_intent_do_not_query_podman(self):
         self.evidence.mkdir(parents=True)
         intent = self.evidence / "resource-intent.json"
-        with patch.object(runner, "run") as command, patch.object(runner, "rootless_store_id", return_value=STORE) as preflight:
+        with patch.object(runner, "run") as command, patch.object(runner, "rootless_store", return_value=STORE) as preflight:
             self.assertEqual(runner.inspect_resources(self.evidence)["reason"], "missing_intent")
             for contents in ("{", json.dumps({"name": "--all", "request_id": self.request, "attempt": "a"*32}),
                              json.dumps({"name": "sovereign-smoke-" + "a"*12, "request_id": "other", "attempt": "a"*32})):
@@ -207,10 +209,16 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(args[-1], name)
                 return f"{name} {NETWORK_ID} {json.dumps(labels)}"
             if args[:2] == ("podman", "create"):
+                self.assertEqual(args[args.index("--network") + 1], NETWORK_ID)
+                return "c" * 64
+            if args[:2] == ("podman", "start"):
+                raise RuntimeError("simulated start failure")
+            if args[:2] == ("podman", "inspect"):
+                return "false"
+            if args == ("podman", "rm", "-v", "c" * 64):
                 name, _ = inventory.pop(NETWORK_ID)
                 inventory[foreign_id] = (name, {})
-                self.assertEqual(args[args.index("--network") + 1], NETWORK_ID)
-                raise subprocess.TimeoutExpired("simulated create", 90)
+                return ""
             if args[:3] == ("podman", "network", "rm"):
                 target = args[-1]
                 removal_targets.append(target)
@@ -221,8 +229,8 @@ class RecoveryTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, args)
             self.fail(f"Unexpected command: {args[:3]}")
 
-        with patch.object(runner, "REPO", self.root), patch.object(runner, "rootless_store_id", return_value=STORE), \
-                patch.object(runner, "run", side_effect=command), self.assertRaises(subprocess.TimeoutExpired):
+        with patch.object(runner, "REPO", self.root), patch.object(runner, "rootless_store", return_value=STORE), \
+                patch.object(runner, "run", side_effect=command), self.assertRaisesRegex(RuntimeError, "simulated start failure"):
             runner.smoke(self.root / "bundle", self.evidence)
         self.assertEqual(removal_targets, [NETWORK_ID])
         self.assertEqual(list(inventory), [foreign_id])
@@ -231,7 +239,7 @@ class RecoveryTests(unittest.TestCase):
         for state in ("foreign", "unknown", "absent"):
             evidence = self.root / state
             with self.subTest(state=state), patch.object(runner, "REPO", self.root), \
-                    patch.object(runner, "rootless_store_id", return_value=STORE), \
+                    patch.object(runner, "rootless_store", return_value=STORE), \
                     patch.object(runner, "inspect_resource", return_value={"state": state}), \
                     patch.object(runner, "run", return_value="") as command:
                 with self.assertRaisesRegex(RuntimeError, "verify"):
@@ -243,25 +251,56 @@ class RecoveryTests(unittest.TestCase):
         self.evidence.mkdir(parents=True)
         graph_root = self.root / "original-storage"
         graph_root.mkdir()
+        (graph_root / "networks").mkdir()
         other_root = self.root / "empty-storage"
         other_root.mkdir()
+        (other_root / "networks").mkdir()
         with patch.object(runner.os, "geteuid", return_value=1000), \
                 patch.object(runner, "run", return_value=info_for(graph_root)) as command:
-            runner.save_resource_intent(self.evidence, "sovereign-smoke-" + "a"*12, runner.rootless_store_id())
+            runner.save_resource_intent(self.evidence, "sovereign-smoke-" + "a"*12, runner.rootless_store())
             for path in (other_root, graph_root):
                 if path == graph_root:
                     graph_root.rename(self.root / "retired-test-directory")
                     graph_root.mkdir()  # Same configured path, different store directory.
+                    (graph_root / "networks").mkdir()
                 command.reset_mock()
                 command.return_value = info_for(path)
                 self.assertEqual(runner.inspect_resources(self.evidence),
                                  {"request_id": self.request, "state": "unknown", "reason": "store_mismatch"})
                 command.assert_called_once_with("podman", "info", "--format", "json", timeout=10)
 
+    def test_replaced_network_config_directory_prevents_absent_snapshot_and_cleanup(self):
+        with patch.object(runner.os, "geteuid", return_value=1000), \
+                patch.object(runner, "run", return_value=info_for(self.root)) as command:
+            original = runner.rootless_store(prepare=True)
+            self.evidence.mkdir(parents=True)
+            runner.save_resource_intent(self.evidence, "sovereign-smoke-" + "a"*12, original)
+            original.network_dir.rename(self.root / "original-inventory")
+            original.network_dir.mkdir()
+            command.reset_mock()
+            self.assertEqual(runner.inspect_resources(self.evidence),
+                             {"request_id": self.request, "state": "unknown", "reason": "store_mismatch"})
+            with self.assertRaisesRegex(RuntimeError, "store changed"):
+                runner.remove_network(NETWORK_ID, original)
+            self.assertEqual([call.args[1] for call in command.call_args_list], ["info", "info"])
+
+    def test_unsupported_backend_rejected_before_creation(self):
+        for backend in ("cni", "unrecognized", None):
+            info = json.loads(info_for(self.root))
+            info["host"]["networkBackend"] = backend
+            with self.subTest(backend=backend), patch.object(runner, "REPO", self.root), \
+                    patch.object(runner.os, "geteuid", return_value=1000), \
+                    patch.object(runner, "run", side_effect=["", json.dumps(info)]) as command:
+                with self.assertRaisesRegex(RuntimeError, "Netavark"):
+                    runner.smoke(self.root / "bundle", self.evidence)
+                self.assertFalse(self.evidence.exists())
+                self.assertFalse((self.root / "networks").exists())
+                self.assertEqual([c.args[:2] for c in command.call_args_list], [("sha256sum", "-c"), ("podman", "info")])
+
     def test_store_change_during_inspection_discards_snapshot(self):
         self.evidence.mkdir(parents=True)
         runner.save_resource_intent(self.evidence, "sovereign-smoke-" + "a"*12, STORE)
-        with patch.object(runner, "rootless_store_id", side_effect=[STORE, "2"*64]), \
+        with patch.object(runner, "rootless_store", side_effect=[STORE, runner.PodmanStore("2"*64, STORE.network_dir)]), \
                 patch.object(runner, "inspect_resource", return_value={"state": "absent"}):
             self.assertEqual(runner.inspect_resources(self.evidence),
                              {"request_id": self.request, "state": "unknown", "reason": "store_mismatch"})
@@ -274,6 +313,15 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(runner.inspect_resources(self.evidence)["reason"], "unverified_store")
             command.assert_not_called()
 
+    def test_prior_store_record_without_network_binding_is_unknown(self):
+        self.evidence.mkdir(parents=True)
+        runner.record(self.evidence / "resource-intent.json",
+                      {"name": "sovereign-smoke-" + "a"*12, "attempt": "a"*32,
+                       "request_id": self.request, "store_id": STORE.fingerprint})
+        with patch.object(runner, "run") as command:
+            self.assertEqual(runner.inspect_resources(self.evidence)["reason"], "unverified_network_config")
+            command.assert_not_called()
+
     def test_absence_and_lookup_failure_are_distinct(self):
         self.evidence.mkdir(parents=True)
         runner.save_resource_intent(self.evidence, "sovereign-smoke-" + "a"*12, STORE)
@@ -283,7 +331,7 @@ class RecoveryTests(unittest.TestCase):
         for replies, expected in (([missing, denied], ("absent", "unknown")),
                                   (["", raced, missing], ("unknown", "absent")),
                                   (["", "malformed", missing], ("unknown", "absent"))):
-            with self.subTest(expected=expected), patch.object(runner, "rootless_store_id", return_value=STORE), \
+            with self.subTest(expected=expected), patch.object(runner, "rootless_store", return_value=STORE), \
                     patch.object(runner, "run", side_effect=replies):
                 resources = runner.inspect_resources(self.evidence)["resources"]
                 self.assertEqual((resources["container"]["state"], resources["network"]["state"]), expected)
@@ -293,12 +341,14 @@ class RecoveryTests(unittest.TestCase):
         evidence.mkdir()
         info = info_for(self.root)
         with patch.object(runner, "run", return_value=info), patch.object(runner.os, "geteuid", return_value=os.geteuid() or 1000):
-            store_id = runner.rootless_store_id()
-        runner.save_resource_intent(evidence, "sovereign-smoke-" + "a"*12, store_id)
+            store = runner.rootless_store(prepare=True)
+        runner.save_resource_intent(evidence, "sovereign-smoke-" + "a"*12, store)
         cmd = [sys.executable, "-I", "-B", str(SOURCE / "scripts/smoke-runner.py"),
                "--inspect-resources", str(evidence)]
         tool = self.root / "podman"
-        tool.write_text("#!/bin/sh\n[ \"$1\" = --remote=false ] || exit 125\nshift\ncase \"$1 $2\" in\n"
+        tool.write_text("#!/bin/sh\n[ \"$1\" = --remote=false ] || exit 125\nshift\n"
+                        f"if [ \"$1\" != info ]; then [ \"$1\" = '--network-config-dir={store.network_dir}' ] || exit 125; shift; fi\n"
+                        "case \"$1 $2\" in\n"
                         f"'info --format') echo '{info}';;\n"
                         "'container exists'|'network exists') exit 1;;\n*) exit 125;;\nesac\n")
         tool.chmod(0o700)
@@ -316,7 +366,7 @@ class RecoveryTests(unittest.TestCase):
     def test_sigkill_after_create_before_id_return(self):
         self.check_interrupted_create("kill")
 
-    def test_create_timeout_after_engine_side_effect(self):
+    def test_uncertain_create_retains_attachment_even_if_engine_allows_removal_by_id(self):
         self.check_interrupted_create("timeout")
 
     def test_lost_dispatch_ack_preserves_one_simulated_trigger(self):

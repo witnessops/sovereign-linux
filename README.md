@@ -78,7 +78,7 @@ machine=$(bash scripts/build-local.sh "$base" /path/to/runner-image.tar) &&
   (cd "$machine" && sha256sum -c SHA256SUMS)
 ```
 
-For one attended test on Linux, the host needs Python 3, rootless Podman, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network. Only its broker port is published on host loopback; the harness calls the main API from inside the container. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
+For one attended test on Linux, the host needs Python 3, rootless Podman with Netavark, QEMU, OpenSSH and the locally available lab main image `0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2`. The harness starts a fresh main on an internal network. Only its broker port is published on host loopback; the harness calls the main API from inside the container. It boots the guest from a temporary overlay, pins a per-run SSH host key and connects the guest to the broker over a restricted QEMU network. The guest checks the runner archive and image ID before starting the unprivileged container. Session keys and the broker token are generated locally for each run.
 
 ```bash
 python3 scripts/smoke-runner.py "$machine" build/my-first-run-evidence
@@ -96,7 +96,9 @@ python3 -I scripts/smoke-runner.py --inspect-resources "$evidence"
 
 Set `evidence` to the original request directory. The JSON snapshot reports each resource as `owned` with its full Podman ID when the generated name and both labels match, `foreign` for a label mismatch, `absent` for a negative existence check, or `unknown` for an inconclusive lookup. Older evidence without an ownership record and invalid records produce `unknown` before Podman is queried. The command exits zero when both lookups return `owned` or `absent`; other outcomes exit nonzero.
 
-Host Podman calls use local mode. The intent records a fingerprint of the machine, effective UID, graph-root path and directory identity, run root, storage driver and network backend. Inspection checks the fingerprint before and after reading the inventory. A different store, an unavailable store, or older evidence without the fingerprint yields `unknown`. Cleanup also checks the store before removing the verified network ID.
+The smoke profile requires local rootless Netavark. Preflight checks the backend before creating smoke resources. The harness explicitly pins every host resource operation to the resolved Netavark directory at `<graphRoot>/networks`. It records that path and includes the directory's device and inode in the store fingerprint alongside the machine, UID, graph root, run root, storage driver and backend. Inspection checks the binding before and after reading the inventory. A replaced directory or a legacy record without a directory binding yields `unknown`.
+
+A timed-out container create may already have attached the container to the network. Once create begins, the harness preserves the network until it receives a full container ID and Podman confirms removal of that container. When cleanup runs with the attachment still uncertain, `stop.json` records `"network_cleanup": "deferred"`. Use read-only inspection with the original request to reconcile the resources.
 
 Inspection reads the current inventory. A pending create can still finish after an `absent` observation. Keep the worker reservation and use the existing dispatch and execution receipts to determine workflow status. The inspector never performs cleanup, dispatches work or changes the ledger. The labels identify runs within the trusted rootless account; anyone with control of that account can copy them.
 
