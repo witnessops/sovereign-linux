@@ -1,0 +1,28 @@
+variant: fcos
+version: 1.6.0
+storage:
+  files:
+    - path: /etc/hostname
+      mode: 0644
+      overwrite: true
+      contents:
+        inline: |
+          sovereign-linux
+systemd:
+  units:
+    - name: sovereign-base-check.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Check the Sovereign Linux base machine
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/grep -Fxq sovereign-linux /etc/hostname
+        ExecStart=/usr/bin/podman --version
+        ExecStart=/usr/bin/echo SOVEREIGN_LINUX_BASE_READY
+        StandardOutput=journal+console
+        StandardError=journal+console
+
+        [Install]
+        WantedBy=multi-user.target
