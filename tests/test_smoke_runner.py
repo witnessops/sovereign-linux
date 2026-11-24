@@ -95,5 +95,76 @@ class MainApiTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1::5678", commands[0])
 
 
+class TerminationTests(unittest.TestCase):
+    def test_sigterm_unwinds_main_cleanup_and_records_stop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "runner").mkdir()
+            (root / "build").mkdir()
+            shutil.copyfile(ROOT / "runner/smoke-workflow.json", root / "runner/smoke-workflow.json")
+            bundle = root / "bundle"
+            bundle.mkdir()
+            for name in ("runner.iso", "machine.ign", "machine.qcow2"):
+                (bundle / name).touch()
+            evidence = root / "evidence"
+            commands = []
+
+            def command(*args, **kwargs):
+                commands.append(args)
+                if args[:2] == ("podman", "create"):
+                    return "main-container"
+                if args[:2] == ("podman", "port"):
+                    runner.terminate_on_sigterm(runner.signal.SIGTERM, None)
+                if args[:2] == ("podman", "inspect"):
+                    return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
+                return ""
+
+            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command), patch.object(runner.signal, "signal"):
+                with self.assertRaises(SystemExit) as stopped:
+                    runner.smoke(bundle, evidence)
+
+            self.assertEqual(stopped.exception.code, 143)
+            self.assertTrue(json.loads((evidence / "stop.json").read_text())["main_stopped"])
+            self.assertIn(("podman", "stop", "-t", "20", "main-container"), commands)
+            self.assertIn(("podman", "rm", "-v", "main-container"), commands)
+
+    def test_sigterm_during_main_start_waits_for_cleanup_registration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "runner").mkdir()
+            (root / "build").mkdir()
+            shutil.copyfile(ROOT / "runner/smoke-workflow.json", root / "runner/smoke-workflow.json")
+            bundle = root / "bundle"
+            bundle.mkdir()
+            for name in ("runner.iso", "machine.ign", "machine.qcow2"):
+                (bundle / name).touch()
+            evidence = root / "evidence"
+            commands = []
+
+            def command(*args, **kwargs):
+                commands.append(args)
+                if args[:2] == ("podman", "create"):
+                    return "main-container"
+                if args[:2] == ("podman", "start"):
+                    runner.signal.getsignal(runner.signal.SIGTERM)(runner.signal.SIGTERM, None)
+                if args[:2] == ("podman", "inspect"):
+                    return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
+                return ""
+
+            previous = runner.signal.getsignal(runner.signal.SIGTERM)
+            runner.signal.signal(runner.signal.SIGTERM, runner.terminate_on_sigterm)
+            try:
+                with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
+                    with self.assertRaises(SystemExit) as stopped:
+                        runner.smoke(bundle, evidence)
+            finally:
+                runner.signal.signal(runner.signal.SIGTERM, previous)
+
+            self.assertEqual(stopped.exception.code, 143)
+            self.assertTrue(json.loads((evidence / "stop.json").read_text())["main_stopped"])
+            self.assertIn(("podman", "stop", "-t", "20", "main-container"), commands)
+            self.assertIn(("podman", "rm", "-v", "main-container"), commands)
+
+
 if __name__ == "__main__":
     unittest.main()
