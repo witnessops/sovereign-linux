@@ -87,3 +87,29 @@ python3 scripts/smoke-runner.py "$machine" build/my-first-run-evidence
 The evidence path must be new. The harness records dispatch intent before submitting the inactive fixture's manual trigger. If a submitted run is interrupted, use its recorded workflow and execution IDs to inspect the saved result before considering another run. Choosing a new directory requests a new execution.
 
 A passing `result.json` records one execution, one Code output item, the fixture marker, and integer `42`. The harness compares the execution API response with the stopped main's SQLite database. It also records VM and main shutdown. The gitignored private database directory is identified in `dispatch-intent.json`. It contains synthetic account and session data and should stay local.
+
+## Local Sovereign Tasks binding
+
+The worker adapter in `bindings/sovereign_smoke.py` implements the fixed `sovereign-linux-n8n-smoke` profile for `ops-laptop-03`. It checks the harness and workflow against build commit `08b05d4d4ed728fcb8d998eec75b3e81657eab2b` and pins the verified bundle's manifest to `1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428`. The harness validates the disk, Ignition file, and runner ISO before boot.
+
+The adapter's `broker_command` maps `run_sovereign_linux_smoke` and `read_sovereign_linux_smoke` to worker operations. Each takes only `request_id` from the owner. The authenticated broker supplies the device and the original claim. The worker reads one bounded JSON command on stdin and returns a JSON response. No socket listener, MCP registration, or service installation is included.
+
+On first delivery the worker commits the request and claim to a private SQLite ledger before launching the fixed harness. The harness runs independently of the broker response timeout. Keep the worker's process group alive through boot and cleanup when configuring service supervision. Poll with the same request and claim. The ledger lives under `~/.local/state/sovereign-tasks/sovereign-linux-n8n-smoke/` with per-request evidence and a private log. Preserve that state across worker restarts.
+
+| Worker state | Meaning |
+| --- | --- |
+| `not_found` | A status read found no reservation. |
+| `running` | The worker log is locked by the running process and no execution ID has been verified yet. |
+| `submitted` | The request evidence contains the workflow and execution IDs while the worker is running. |
+| `uncertain` | The reservation exists but the evidence is incomplete or inconsistent. Re-read the same request. A new run is blocked pending reconciliation. |
+| `complete` | Both saved-result readbacks and the shutdown record agree. Subsequent reads and duplicate runs return the stored receipt. |
+
+Each fresh n8n database may start with execution ID `1`. Use the request, claim, workflow, and execution identifiers together. Duplicate delivery of another claim for a reserved request is refused.
+
+Run the offline checks from the checkout root:
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
+For live integration the owner-facing tools and broker must admit this profile separately from the legacy lab. Route its claimed commands to this adapter under the intended worker identity. Status reads must reuse the original claim, including before an execution ID exists. The broker must accept the states above and scope execution IDs to their request. Live activation is a separate operator action.
