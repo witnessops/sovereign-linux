@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import socket
@@ -21,6 +22,8 @@ MAIN = "0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2"
 RUNNER = "8045f3fa0f22bb5e140133c95bebed0f7293867a0b3a47a1dc5453b0d61ea689"
 FIXTURE = "500d50173083a1b3fb699f2c3099b1dd0bc3a866b481a40f0e68c60fc06fad91"
 MARKER = "wops-vm-smoke-20261113"
+REQUEST_LABEL = "io.sovereignlinux.smoke.request"
+ATTEMPT_LABEL = "io.sovereignlinux.smoke.attempt"
 MAIN_API_CLIENT = """
 const http = require('node:http');
 let input = '';
@@ -183,6 +186,76 @@ def require_rootless_host():
         raise RuntimeError("The host n8n main requires rootless Podman")
 
 
+def request_id_for(evidence):
+    if re.fullmatch(r"smoke_[0-9a-f]{32}", evidence.name):
+        return evidence.name
+    # Standalone callers can choose arbitrary directory names. Keep them off Podman labels.
+    return "local_" + hashlib.sha256(os.fsencode(evidence.name)).hexdigest()
+
+
+def save_resource_intent(evidence, name):
+    intent = {"request_id": request_id_for(evidence), "name": name, "attempt": secrets.token_hex(16)}
+    record(evidence / "resource-intent.json", intent)
+    for directory in (evidence, evidence.parent):
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return ["--label", f"{REQUEST_LABEL}={intent['request_id']}",
+            "--label", f"{ATTEMPT_LABEL}={intent['attempt']}"]
+
+
+def inspect_resource(kind, intent):
+    name = intent["name"]
+    try:
+        run("podman", kind, "exists", name, timeout=10, stderr=sp.DEVNULL)
+    except sp.CalledProcessError as error:
+        if error.returncode == 1:
+            return {"state": "absent"}
+        raise
+
+    label_field = ".Config.Labels" if kind == "container" else ".Labels"
+    fields = "{{.Name}} {{.ID}} {{json " + label_field + "}}"
+    raw = run("podman", kind, "inspect", "--format", fields, name, timeout=10, stderr=sp.DEVNULL)
+    actual_name, resource_id, raw_labels = raw.split(" ", 2)
+    labels = json.loads(raw_labels)
+    if actual_name != name or not re.fullmatch(r"[0-9a-f]{64}", resource_id):
+        return {"state": "unknown", "reason": "unexpected_identity"}
+    if labels is not None and not isinstance(labels, dict):
+        return {"state": "unknown", "reason": "invalid_labels"}
+    if (not labels or labels.get(REQUEST_LABEL) != intent["request_id"]
+            or labels.get(ATTEMPT_LABEL) != intent["attempt"]):
+        return {"state": "foreign"}
+    return {"state": "owned", "id": resource_id}
+
+
+def inspect_resources(evidence):
+    request_id = request_id_for(evidence)
+    try:
+        intent = json.loads((evidence / "resource-intent.json").read_bytes())
+    except FileNotFoundError:
+        return {"request_id": request_id, "state": "unknown", "reason": "missing_intent"}
+    except (OSError, ValueError):
+        intent = None
+    if (not isinstance(intent, dict) or intent.get("request_id") != request_id
+            or not isinstance(intent.get("name"), str) or not re.fullmatch(r"sovereign-smoke-[0-9a-f]{12}", intent["name"])
+            or not isinstance(intent.get("attempt"), str) or not re.fullmatch(r"[0-9a-f]{32}", intent["attempt"])):
+        return {"request_id": request_id, "state": "unknown", "reason": "invalid_intent"}
+
+    try:
+        require_rootless_host()
+    except (OSError, RuntimeError, sp.SubprocessError):
+        return {"request_id": request_id, "state": "unknown", "reason": "rootless_host_unavailable"}
+    resources = {}
+    for kind in ("container", "network"):
+        try:
+            resources[kind] = inspect_resource(kind, intent)
+        except (OSError, ValueError, sp.SubprocessError):
+            resources[kind] = {"state": "unknown", "reason": "inspection_failed"}
+    return {"request_id": request_id, "resources": resources}
+
+
 def smoke(bundle, evidence):
     fixture = (REPO / "runner/smoke-workflow.json").read_bytes()
     if hashlib.sha256(fixture).hexdigest() != FIXTURE:
@@ -194,6 +267,7 @@ def smoke(bundle, evidence):
     require_rootless_host()
     evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     name = "sovereign-smoke-" + secrets.token_hex(6)
+    labels = save_resource_intent(evidence, name)
     db_dir = REPO / "build" / name
     db_dir.mkdir(mode=0o700)
     print("Private SQLite directory:", db_dir, flush=True)
@@ -204,7 +278,7 @@ def smoke(bundle, evidence):
             tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="sovereign-smoke-")))
             # Keep the database after shutdown for independent, read-only verification.
             with defer_sigterm():
-                run("podman", "network", "create", "--internal", name)
+                run("podman", "network", "create", "--internal", *labels, name)
                 stack.callback(run, "podman", "network", "rm", name)
             env = dict(os.environ, N8N_RUNNERS_AUTH_TOKEN=token, N8N_ENCRYPTION_KEY=secrets.token_hex(32))
             settings = ["N8N_RUNNERS_MODE=external", "N8N_RUNNERS_ENABLED=true",
@@ -217,7 +291,7 @@ def smoke(bundle, evidence):
                         "N8N_PERSONALIZATION_ENABLED=false", "N8N_RUNNERS_AUTH_TOKEN", "N8N_ENCRYPTION_KEY"]
             env_args = [arg for setting in settings for arg in ("-e", setting)]
             with defer_sigterm():
-                cid = run("podman", "create", "--pull=never", "--name", name, "--network", name,
+                cid = run("podman", "create", "--pull=never", *labels, "--name", name, "--network", name,
                           "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
                           "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
                 stack.callback(run, "podman", "rm", "-v", cid)
@@ -365,9 +439,18 @@ def smoke(bundle, evidence):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("bundle", type=Path, nargs="?")
+    mode.add_argument("--inspect-resources", action="store_true",
+                      help="read the ownership record and current rootless Podman resources")
     parser.add_argument("evidence", type=Path, help="new private evidence directory")
     args = parser.parse_args()
     os.umask(0o077)
+    if args.inspect_resources:
+        snapshot = inspect_resources(args.evidence.absolute())
+        print(json.dumps(snapshot, sort_keys=True))
+        resources = snapshot.get("resources", {})
+        raise SystemExit(0 if resources and all(item["state"] in ("owned", "absent")
+                                                for item in resources.values()) else 1)
     signal.signal(signal.SIGTERM, terminate_on_sigterm)
     smoke(args.bundle.resolve(), args.evidence.resolve())
