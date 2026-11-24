@@ -4,7 +4,6 @@ import base64
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
-import http.cookiejar
 import json
 import os
 from pathlib import Path
@@ -14,18 +13,75 @@ import sqlite3
 import subprocess as sp
 import tempfile
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import build_opener, HTTPCookieProcessor, ProxyHandler, Request
+from urllib.error import HTTPError
 
 REPO = Path(__file__).resolve().parents[1]
 MAIN = "0fc7fd41adb46f4b70f1c8501325aab91f28363df6d2dd567720372def7037c2"
 RUNNER = "8045f3fa0f22bb5e140133c95bebed0f7293867a0b3a47a1dc5453b0d61ea689"
 FIXTURE = "500d50173083a1b3fb699f2c3099b1dd0bc3a866b481a40f0e68c60fc06fad91"
 MARKER = "wops-vm-smoke-20261113"
+MAIN_API_CLIENT = """
+const http = require('node:http');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+  const frame = JSON.parse(input);
+  const body = frame.body === null ? null : JSON.stringify(frame.body);
+  const headers = { 'Content-Type': 'application/json' };
+  if (frame.cookie) headers.Cookie = frame.cookie;
+  if (body !== null) headers['Content-Length'] = Buffer.byteLength(body);
+  const request = http.request({
+    host: '127.0.0.1', port: 5678, path: '/rest' + frame.path,
+    method: body === null ? 'GET' : 'POST', headers,
+  }, response => {
+    const chunks = [];
+    response.on('data', chunk => { chunks.push(chunk); });
+    response.on('end', () => {
+      process.stdout.write(JSON.stringify({
+        status: response.statusCode,
+        cookies: response.headers['set-cookie'] || [],
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+  });
+  request.on('error', error => {
+    process.stderr.write(error.message + '\\n');
+    process.exitCode = 1;
+  });
+  request.end(body === null ? undefined : body);
+});
+"""
 
 
 def run(*args, timeout=90, **kwargs):
     return sp.run(args, text=True, stdout=sp.PIPE, check=True, timeout=timeout, **kwargs).stdout.strip()
+
+
+class MainApi:
+    def __init__(self, container):
+        self.container = container
+        self.cookies = {}
+
+    def request(self, path, body=None):
+        frame = {"path": path, "body": body,
+                 "cookie": "; ".join(f"{name}={value}" for name, value in self.cookies.items())}
+        raw = run("podman", "exec", "-i", self.container, "node", "-e", MAIN_API_CLIENT,
+                  input=json.dumps(frame), timeout=15)
+        response = json.loads(raw)
+        if (not isinstance(response, dict) or type(response.get("status")) is not int
+                or not isinstance(response.get("cookies"), list)
+                or not isinstance(response.get("body"), str)):
+            raise ValueError("Unexpected n8n API response")
+        for cookie in response["cookies"]:
+            if not isinstance(cookie, str) or "=" not in cookie:
+                raise ValueError("Unexpected n8n API cookie")
+            name, value = cookie.split(";", 1)[0].split("=", 1)
+            self.cookies[name] = value
+        if not 200 <= response["status"] < 300:
+            raise HTTPError("http://127.0.0.1:5678/rest" + path, response["status"],
+                            "n8n API request failed", None, None)
+        return json.loads(response["body"])["data"]
 
 
 def record(path, data):
@@ -135,7 +191,7 @@ def smoke(bundle, evidence):
             env_args = [arg for setting in settings for arg in ("-e", setting)]
             cid = run("podman", "create", "--pull=never", "--name", name, "--network", name,
                       "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
-                      "-p", "127.0.0.1::5678", "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
+                      "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
             stack.callback(run, "podman", "rm", "-v", cid)
             run("podman", "start", cid)
 
@@ -144,20 +200,13 @@ def smoke(bundle, evidence):
                 cleanup["main_stopped"] = run("podman", "inspect", "--format", "{{.State.Running}}", cid) == "false"
 
             stack.callback(stop_main)
-            ui, broker = [int(run("podman", "port", cid, str(n)).split(":")[-1]) for n in (5678, 5679)]
-            api = build_opener(ProxyHandler({}), HTTPCookieProcessor(http.cookiejar.CookieJar()))
-
-            def request(path, body=None):
-                req = Request(f"http://127.0.0.1:{ui}/rest" + path,
-                              data=json.dumps(body).encode() if body is not None else None,
-                              headers={"Content-Type": "application/json"})
-                with api.open(req, timeout=15) as response:
-                    return json.load(response)["data"]
+            broker = int(run("podman", "port", cid, "5679").split(":")[-1])
+            request = MainApi(cid).request
 
             def settings_ready():
                 try:
                     return request("/settings")
-                except (URLError, ConnectionError, json.JSONDecodeError):
+                except (sp.CalledProcessError, sp.TimeoutExpired, HTTPError, json.JSONDecodeError):
                     return None
 
             settings_data = until(settings_ready, 120, "fresh n8n main")

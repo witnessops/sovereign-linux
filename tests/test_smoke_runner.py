@@ -1,8 +1,11 @@
 import importlib.util
+import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +38,61 @@ class HostPreflightTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
                     runner.smoke(bundle, evidence)
             self.assertFalse(evidence.exists())
+
+
+class MainApiTests(unittest.TestCase):
+    def test_owner_setup_password_uses_stdin_and_cookie_is_reused(self):
+        replies = [
+            {"status": 200, "cookies": ["n8n-auth=session-value; HttpOnly; Path=/"],
+             "body": json.dumps({"data": {"owner": True}})},
+            {"status": 200, "cookies": [], "body": json.dumps({"data": {"workflows": []}})},
+        ]
+        with patch.object(runner, "run", side_effect=[json.dumps(reply) for reply in replies]) as command:
+            api = runner.MainApi("main-container")
+            self.assertEqual(api.request("/owner/setup", {"password": "private-password"}), {"owner": True})
+            self.assertEqual(api.request("/workflows/"), {"workflows": []})
+
+        first, second = command.call_args_list
+        self.assertEqual(first.args[:5], ("podman", "exec", "-i", "main-container", "node"))
+        self.assertNotIn("private-password", " ".join(map(str, first.args)))
+        self.assertEqual(json.loads(first.kwargs["input"])["body"]["password"], "private-password")
+        self.assertEqual(json.loads(second.kwargs["input"])["cookie"], "n8n-auth=session-value")
+
+    def test_execution_not_found_remains_retryable(self):
+        reply = {"status": 404, "cookies": [], "body": "missing"}
+        with patch.object(runner, "run", return_value=json.dumps(reply)):
+            with self.assertRaises(HTTPError) as error:
+                runner.MainApi("main-container").request("/executions/1")
+        self.assertEqual(error.exception.code, 404)
+
+    def test_main_ui_is_not_published_on_host(self):
+        class StopAtCreate(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "runner").mkdir()
+            (root / "build").mkdir()
+            shutil.copyfile(ROOT / "runner/smoke-workflow.json", root / "runner/smoke-workflow.json")
+            bundle = root / "bundle"
+            bundle.mkdir()
+            for name in ("runner.iso", "machine.ign", "machine.qcow2"):
+                (bundle / name).touch()
+            commands = []
+
+            def command(*args, **kwargs):
+                if args[:2] == ("podman", "create"):
+                    commands.append(args)
+                    raise StopAtCreate
+                return ""
+
+            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
+                with self.assertRaises(StopAtCreate):
+                    runner.smoke(bundle, root / "evidence")
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("127.0.0.1::5679", commands[0])
+        self.assertNotIn("127.0.0.1::5678", commands[0])
 
 
 if __name__ == "__main__":
