@@ -14,7 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PROFILE = "sovereign-linux-n8n-smoke"
 DEVICE = "ops-laptop-03"
-REVISION = "3266754586355ffd3fa85f82d06ef28b0e319a5f"
+REVISION = "eb382ec07dfe902d44b09e3ca8288329f0cc64fc"
 BUNDLE = REPO / "build/machine.PToCA9g4"
 MANIFEST = "1c7197b0492db12f0f7c668c2ab05595ed0abac2a8f6722b487c268142dbf428"
 FIXTURE = "500d50173083a1b3fb699f2c3099b1dd0bc3a866b481a40f0e68c60fc06fad91"
