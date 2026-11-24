@@ -88,13 +88,15 @@ The evidence path must be new. The harness records dispatch intent before submit
 
 ### Inspect host resources after an interruption
 
-Before creating the rootless network or main container, the harness saves `resource-intent.json` in the private request directory. Both objects carry the same request ID and a fresh attempt label. From the same rootless Podman account and store, inspect the original evidence directory with:
+Before creating the rootless network or main container, the harness saves `resource-intent.json` in the private request directory. Both objects carry the same request ID and a fresh attempt label. After creating the network, the harness verifies its name and both labels, then uses its full network ID for container attachment and cleanup. If ownership or a creation-specific ID cannot be verified, startup stops and the intent remains available for inspection. From the same rootless Podman account and store, inspect the original evidence directory with:
 
 ```bash
 python3 -I scripts/smoke-runner.py --inspect-resources "$evidence"
 ```
 
 Set `evidence` to the original request directory. The JSON snapshot reports each resource as `owned` with its full Podman ID when the generated name and both labels match, `foreign` for a label mismatch, `absent` for a negative existence check, or `unknown` for an inconclusive lookup. Older evidence without an ownership record and invalid records produce `unknown` before Podman is queried. The command exits zero when both lookups return `owned` or `absent`; other outcomes exit nonzero.
+
+Host Podman calls use local mode. The intent records a fingerprint of the machine, effective UID, graph-root path and directory identity, run root, storage driver and network backend. Inspection checks the fingerprint before and after reading the inventory. A different store, an unavailable store, or older evidence without the fingerprint yields `unknown`. Cleanup also checks the store before removing the verified network ID.
 
 Inspection reads the current inventory. A pending create can still finish after an `absent` observation. Keep the worker reservation and use the existing dispatch and execution receipts to determine workflow status. The inspector never performs cleanup, dispatches work or changes the ledger. The labels identify runs within the trusted rootless account; anyone with control of that account can copy them.
 

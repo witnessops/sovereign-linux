@@ -18,14 +18,15 @@ class HostPreflightTests(unittest.TestCase):
     def test_root_host_is_refused_before_podman_access(self):
         with patch.object(runner.os, "geteuid", return_value=0), patch.object(runner, "run") as command:
             with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
-                runner.require_rootless_host()
+                runner.rootless_store_id()
         command.assert_not_called()
 
     def test_rootful_podman_is_refused(self):
-        with patch.object(runner.os, "geteuid", return_value=1000), patch.object(runner, "run", return_value="false") as command:
+        with patch.object(runner.os, "geteuid", return_value=1000), patch.object(runner, "run", return_value=json.dumps({
+                "host": {"security": {"rootless": False}}, "store": {}})) as command:
             with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
-                runner.require_rootless_host()
-        command.assert_called_once_with("podman", "info", "--format", "{{.Host.Security.Rootless}}")
+                runner.rootless_store_id()
+        command.assert_called_once_with("podman", "info", "--format", "json", timeout=10)
 
     def test_host_check_precedes_evidence_creation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -34,7 +35,7 @@ class HostPreflightTests(unittest.TestCase):
             for name in ("runner.iso", "machine.ign", "machine.qcow2"):
                 (bundle / name).touch()
             evidence = Path(temp) / "evidence"
-            with patch.object(runner, "run"), patch.object(runner, "require_rootless_host", side_effect=RuntimeError("rootless Podman")):
+            with patch.object(runner, "run"), patch.object(runner, "rootless_store_id", side_effect=RuntimeError("rootless Podman")):
                 with self.assertRaisesRegex(RuntimeError, "rootless Podman"):
                     runner.smoke(bundle, evidence)
             self.assertFalse(evidence.exists())
@@ -86,7 +87,12 @@ class MainApiTests(unittest.TestCase):
                     raise StopAtCreate
                 return ""
 
-            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
+            with (
+                patch.object(runner, "REPO", root),
+                patch.object(runner, "rootless_store_id", return_value="1" * 64),
+                patch.object(runner, "inspect_resource", return_value={"state": "owned", "id": "a" * 64}),
+                patch.object(runner, "run", side_effect=command),
+            ):
                 with self.assertRaises(StopAtCreate):
                     runner.smoke(bundle, root / "evidence")
 
@@ -119,7 +125,13 @@ class TerminationTests(unittest.TestCase):
                     return "false" if ("podman", "stop", "-t", "20", "main-container") in commands else "true"
                 return ""
 
-            with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command), patch.object(runner.signal, "signal"):
+            with (
+                patch.object(runner, "REPO", root),
+                patch.object(runner, "rootless_store_id", return_value="1" * 64),
+                patch.object(runner, "inspect_resource", return_value={"state": "owned", "id": "a" * 64}),
+                patch.object(runner, "run", side_effect=command),
+                patch.object(runner.signal, "signal"),
+            ):
                 with self.assertRaises(SystemExit) as stopped:
                     runner.smoke(bundle, evidence)
 
@@ -154,7 +166,12 @@ class TerminationTests(unittest.TestCase):
             previous = runner.signal.getsignal(runner.signal.SIGTERM)
             runner.signal.signal(runner.signal.SIGTERM, runner.terminate_on_sigterm)
             try:
-                with patch.object(runner, "REPO", root), patch.object(runner, "require_rootless_host"), patch.object(runner, "run", side_effect=command):
+                with (
+                    patch.object(runner, "REPO", root),
+                    patch.object(runner, "rootless_store_id", return_value="1" * 64),
+                    patch.object(runner, "inspect_resource", return_value={"state": "owned", "id": "a" * 64}),
+                    patch.object(runner, "run", side_effect=command),
+                ):
                     with self.assertRaises(SystemExit) as stopped:
                         runner.smoke(bundle, evidence)
             finally:

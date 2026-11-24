@@ -59,6 +59,8 @@ process.stdin.on('end', () => {
 
 
 def run(*args, timeout=90, **kwargs):
+    if args[0] == "podman":
+        args = ("podman", "--remote=false", *args[1:])
     return sp.run(args, text=True, stdout=sp.PIPE, check=True, timeout=timeout, **kwargs).stdout.strip()
 
 
@@ -181,9 +183,25 @@ def saved_result(serialized):
     return {"code_runs": len(runs), "items": len(items), "marker": MARKER, "result": number}
 
 
-def require_rootless_host():
-    if os.geteuid() == 0 or run("podman", "info", "--format", "{{.Host.Security.Rootless}}") != "true":
+def rootless_store_id():
+    uid = os.geteuid()
+    if uid == 0:
         raise RuntimeError("The host n8n main requires rootless Podman")
+    info = json.loads(run("podman", "info", "--format", "json", timeout=10))
+    host, store = info["host"], info["store"]
+    if host["security"]["rootless"] is not True or host["serviceIsRemote"] is not False:
+        raise RuntimeError("The host n8n main requires local rootless Podman")
+    root = Path(store["graphRoot"])
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError("Expected a local Podman graph root directory")
+    root = root.resolve(strict=True)
+    meta = root.stat()
+    machine = Path("/etc/machine-id").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", machine):
+        raise ValueError("Unavailable local machine identity")
+    identity = [machine, uid, str(root), meta.st_dev, meta.st_ino, store["runRoot"],
+                store["graphDriverName"], host["networkBackend"]]
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
 
 
 def request_id_for(evidence):
@@ -193,8 +211,9 @@ def request_id_for(evidence):
     return "local_" + hashlib.sha256(os.fsencode(evidence.name)).hexdigest()
 
 
-def save_resource_intent(evidence, name):
-    intent = {"request_id": request_id_for(evidence), "name": name, "attempt": secrets.token_hex(16)}
+def save_resource_intent(evidence, name, store_id):
+    intent = {"request_id": request_id_for(evidence), "name": name, "attempt": secrets.token_hex(16),
+              "store_id": store_id}
     record(evidence / "resource-intent.json", intent)
     for directory in (evidence, evidence.parent):
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -202,8 +221,7 @@ def save_resource_intent(evidence, name):
             os.fsync(fd)
         finally:
             os.close(fd)
-    return ["--label", f"{REQUEST_LABEL}={intent['request_id']}",
-            "--label", f"{ATTEMPT_LABEL}={intent['attempt']}"]
+    return intent
 
 
 def inspect_resource(kind, intent):
@@ -230,6 +248,17 @@ def inspect_resource(kind, intent):
     return {"state": "owned", "id": resource_id}
 
 
+def remove_network(network_id, store_id):
+    if rootless_store_id() != store_id:
+        raise RuntimeError("Podman store changed before network cleanup")
+    try:
+        run("podman", "network", "rm", network_id)
+    except sp.CalledProcessError as error:
+        # For one full network ID, exit 1 means the original is already gone.
+        if error.returncode != 1:
+            raise
+
+
 def inspect_resources(evidence):
     request_id = request_id_for(evidence)
     try:
@@ -243,17 +272,21 @@ def inspect_resources(evidence):
             or not isinstance(intent.get("attempt"), str) or not re.fullmatch(r"[0-9a-f]{32}", intent["attempt"])):
         return {"request_id": request_id, "state": "unknown", "reason": "invalid_intent"}
 
+    if not isinstance(intent.get("store_id"), str) or not re.fullmatch(r"[0-9a-f]{64}", intent["store_id"]):
+        return {"request_id": request_id, "state": "unknown", "reason": "unverified_store"}
     try:
-        require_rootless_host()
-    except (OSError, RuntimeError, sp.SubprocessError):
+        if rootless_store_id() == intent["store_id"]:
+            resources = {}
+            for kind in ("container", "network"):
+                try:
+                    resources[kind] = inspect_resource(kind, intent)
+                except (OSError, ValueError, sp.SubprocessError):
+                    resources[kind] = {"state": "unknown", "reason": "inspection_failed"}
+            if rootless_store_id() == intent["store_id"]:
+                return {"request_id": request_id, "resources": resources}
+        return {"request_id": request_id, "state": "unknown", "reason": "store_mismatch"}
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, sp.SubprocessError):
         return {"request_id": request_id, "state": "unknown", "reason": "rootless_host_unavailable"}
-    resources = {}
-    for kind in ("container", "network"):
-        try:
-            resources[kind] = inspect_resource(kind, intent)
-        except (OSError, ValueError, sp.SubprocessError):
-            resources[kind] = {"state": "unknown", "reason": "inspection_failed"}
-    return {"request_id": request_id, "resources": resources}
 
 
 def smoke(bundle, evidence):
@@ -264,10 +297,12 @@ def smoke(bundle, evidence):
         if not (bundle / name).is_file():
             raise ValueError("Missing bundle file: " + name)
     run("sha256sum", "-c", "SHA256SUMS", cwd=bundle)
-    require_rootless_host()
+    store_id = rootless_store_id()
     evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     name = "sovereign-smoke-" + secrets.token_hex(6)
-    labels = save_resource_intent(evidence, name)
+    intent = save_resource_intent(evidence, name, store_id)
+    labels = ["--label", f"{REQUEST_LABEL}={intent['request_id']}",
+              "--label", f"{ATTEMPT_LABEL}={intent['attempt']}"]
     db_dir = REPO / "build" / name
     db_dir.mkdir(mode=0o700)
     print("Private SQLite directory:", db_dir, flush=True)
@@ -279,7 +314,13 @@ def smoke(bundle, evidence):
             # Keep the database after shutdown for independent, read-only verification.
             with defer_sigterm():
                 run("podman", "network", "create", "--internal", *labels, name)
-                stack.callback(run, "podman", "network", "rm", name)
+                network = inspect_resource("network", intent)
+                if network["state"] != "owned":
+                    raise RuntimeError("Could not verify the new network's ownership")
+                network_id = network["id"]
+                if network_id == hashlib.sha256(name.encode()).hexdigest():
+                    raise RuntimeError("Podman returned a name-derived network ID")
+                stack.callback(remove_network, network_id, store_id)
             env = dict(os.environ, N8N_RUNNERS_AUTH_TOKEN=token, N8N_ENCRYPTION_KEY=secrets.token_hex(32))
             settings = ["N8N_RUNNERS_MODE=external", "N8N_RUNNERS_ENABLED=true",
                         "N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0", "N8N_RUNNERS_MAX_CONCURRENCY=1",
@@ -291,7 +332,7 @@ def smoke(bundle, evidence):
                         "N8N_PERSONALIZATION_ENABLED=false", "N8N_RUNNERS_AUTH_TOKEN", "N8N_ENCRYPTION_KEY"]
             env_args = [arg for setting in settings for arg in ("-e", setting)]
             with defer_sigterm():
-                cid = run("podman", "create", "--pull=never", *labels, "--name", name, "--network", name,
+                cid = run("podman", "create", "--pull=never", *labels, "--name", name, "--network", network_id,
                           "--userns=keep-id:uid=1000,gid=1000", "-v", f"{db_dir}:/home/node/.n8n:rw",
                           "-p", "127.0.0.1::5679", *env_args, MAIN, env=env)
                 stack.callback(run, "podman", "rm", "-v", cid)
